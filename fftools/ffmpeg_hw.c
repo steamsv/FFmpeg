@@ -548,14 +548,17 @@ int hwaccel_decode_init(AVCodecContext *avctx)
     return 0;
 }
 
-AVBufferRef *hw_device_for_filter(void)
+int hw_device_setup_for_filter(FilterGraph *fg)
 {
+    HWDevice *dev;
+    int i;
+
     // Pick the last hardware device if the user doesn't pick the device for
     // filters explicitly with the filter_hw_device option.
     if (filter_hw_device)
-        return filter_hw_device->device_ref;
+        dev = filter_hw_device;
     else if (nb_hw_devices > 0) {
-        HWDevice *dev = hw_devices[nb_hw_devices - 1];
+        dev = hw_devices[nb_hw_devices - 1];
 
         if (nb_hw_devices > 1)
             av_log(NULL, AV_LOG_WARNING, "There are %d hardware devices. device "
@@ -564,9 +567,17 @@ AVBufferRef *hw_device_for_filter(void)
                    "%s is not usable for filters.\n",
                    nb_hw_devices, dev->name,
                    av_hwdevice_get_type_name(dev->type), dev->name);
+    } else
+        dev = NULL;
 
-        return dev->device_ref;
+    if (dev) {
+        for (i = 0; i < fg->graph->nb_filters; i++) {
+            fg->graph->filters[i]->hw_device_ctx =
+                av_buffer_ref(dev->device_ref);
+            if (!fg->graph->filters[i]->hw_device_ctx)
+                return AVERROR(ENOMEM);
+        }
     }
 
-    return NULL;
+    return 0;
 }

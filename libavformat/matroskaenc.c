@@ -58,7 +58,6 @@
 #include "libavutil/stereo3d.h"
 
 #include "libavcodec/av1.h"
-#include "libavcodec/avcodec.h"
 #include "libavcodec/codec_desc.h"
 #include "libavcodec/xiph.h"
 #include "libavcodec/mpeg4audio.h"
@@ -188,8 +187,6 @@ typedef struct mkv_track {
     int64_t         last_timestamp;
     int64_t         duration;
     int64_t         duration_offset;
-    uint64_t        max_blockaddid;
-    int64_t         blockadditionmapping_offset;
     int             codecpriv_offset;
     unsigned        codecpriv_size;     ///< size reserved for CodecPrivate excluding header+length field
     int64_t         ts_offset;
@@ -1145,27 +1142,6 @@ static int mkv_assemble_native_codecprivate(AVFormatContext *s, AVIOContext *dyn
         else
             *size_to_reserve = MAX_PCE_SIZE;
         break;
-    case AV_CODEC_ID_ARIB_CAPTION: {
-        unsigned stream_identifier, data_component_id;
-        switch (par->profile) {
-        case FF_PROFILE_ARIB_PROFILE_A:
-            stream_identifier = 0x30;
-            data_component_id = 0x0008;
-            break;
-        case FF_PROFILE_ARIB_PROFILE_C:
-            stream_identifier = 0x87;
-            data_component_id = 0x0012;
-            break;
-        default:
-            av_log(s, AV_LOG_ERROR,
-                   "Unset/unknown ARIB caption profile %d utilized!\n",
-                   par->profile);
-            return AVERROR_INVALIDDATA;
-        }
-        avio_w8(dyn_cp, stream_identifier);
-        avio_wb16(dyn_cp, data_component_id);
-        break;
-    }
 #endif
     default:
         if (CONFIG_MATROSKA_MUXER && par->codec_id == AV_CODEC_ID_PRORES &&
@@ -1599,20 +1575,11 @@ static int mkv_write_stereo_mode(AVFormatContext *s, EbmlWriter *writer,
     return 0;
 }
 
-static void mkv_write_blockadditionmapping(AVFormatContext *s, MatroskaMuxContext *mkv,
-                                           AVIOContext *pb, mkv_track *track, AVStream *st)
+static void mkv_write_dovi(AVFormatContext *s, AVIOContext *pb, AVStream *st)
 {
 #if CONFIG_MATROSKA_MUXER
     AVDOVIDecoderConfigurationRecord *dovi = (AVDOVIDecoderConfigurationRecord *)
                                              av_stream_get_side_data(st, AV_PKT_DATA_DOVI_CONF, NULL);
-
-    if (IS_SEEKABLE(s->pb, mkv)) {
-        track->blockadditionmapping_offset = avio_tell(pb);
-        // We can't know at this point if there will be a block with BlockAdditions, so
-        // we either write the default value here, or a void element. Either of them will
-        // be overwritten when finishing the track.
-        put_ebml_uint(mkv->track.bc, MATROSKA_ID_TRACKMAXBLKADDID, 0);
-    }
 
     if (dovi && dovi->dv_profile <= 10) {
         ebml_master mapping;
@@ -1623,9 +1590,9 @@ static void mkv_write_blockadditionmapping(AVFormatContext *s, MatroskaMuxContex
                                 + (2 + 1 + 4) + (2 + 1 + ISOM_DVCC_DVVC_SIZE);
 
         if (dovi->dv_profile > 7) {
-            type = MATROSKA_BLOCK_ADD_ID_TYPE_DVVC;
+            type = MKBETAG('d', 'v', 'v', 'C');
         } else {
-            type = MATROSKA_BLOCK_ADD_ID_TYPE_DVCC;
+            type = MKBETAG('d', 'v', 'c', 'C');
         }
 
         ff_isom_put_dvcc_dvvc(s, buf, dovi);
@@ -1857,6 +1824,9 @@ static int mkv_write_track(AVFormatContext *s, MatroskaMuxContext *mkv,
         if (ret < 0)
             return ret;
 
+        if (!IS_WEBM(mkv))
+            mkv_write_dovi(s, pb, st);
+
         break;
 
     case AVMEDIA_TYPE_AUDIO:
@@ -1931,9 +1901,6 @@ static int mkv_write_track(AVFormatContext *s, MatroskaMuxContext *mkv,
         av_log(s, AV_LOG_ERROR, "Only audio, video, and subtitles are supported for Matroska.\n");
         return AVERROR(EINVAL);
     }
-
-    if (!IS_WEBM(mkv))
-        mkv_write_blockadditionmapping(s, mkv, pb, track, st);
 
     if (!IS_WEBM(mkv) || par->codec_id != AV_CODEC_ID_WEBVTT) {
         uint8_t *codecpriv;
@@ -2668,7 +2635,7 @@ static int mkv_write_block(void *logctx, MatroskaMuxContext *mkv,
                                         &side_data_size);
     if (side_data && side_data_size >= 8 &&
         // Only the Codec-specific BlockMore (id == 1) is currently supported.
-        (additional_id = AV_RB64(side_data)) == MATROSKA_BLOCK_ADD_ID_TYPE_OPAQUE) {
+        (additional_id = AV_RB64(side_data)) == 1) {
         ebml_writer_open_master(&writer, MATROSKA_ID_BLOCKADDITIONS);
         ebml_writer_open_master(&writer, MATROSKA_ID_BLOCKMORE);
         /* Until dbc50f8a our demuxer used a wrong default value
@@ -2678,7 +2645,6 @@ static int mkv_write_block(void *logctx, MatroskaMuxContext *mkv,
                              side_data + 8, side_data_size - 8);
         ebml_writer_close_master(&writer);
         ebml_writer_close_master(&writer);
-        track->max_blockaddid = additional_id;
     }
 
     if (!force_blockgroup && writer.nb_elements == 2) {
@@ -3082,21 +3048,6 @@ after_cues:
 
     if (mkv->track.bc) {
         // write Tracks master
-        if (!IS_WEBM(mkv))
-            for (unsigned i = 0; i < s->nb_streams; i++) {
-                const mkv_track *track = &mkv->tracks[i];
-
-                if (!track->max_blockaddid)
-                    continue;
-
-                // We reserved a single byte to write this value.
-                av_assert0(track->max_blockaddid <= 0xFF);
-
-                avio_seek(mkv->track.bc, track->blockadditionmapping_offset, SEEK_SET);
-
-                put_ebml_uint(mkv->track.bc, MATROSKA_ID_TRACKMAXBLKADDID, track->max_blockaddid);
-            }
-
         avio_seek(pb, mkv->track.pos, SEEK_SET);
         ret = end_ebml_master_crc32(pb, &mkv->track.bc, mkv,
                                     MATROSKA_ID_TRACKS, 0, 0, 0);
@@ -3323,7 +3274,6 @@ static const AVCodecTag additional_subtitle_tags[] = {
     { AV_CODEC_ID_DVB_SUBTITLE,      0xFFFFFFFF },
     { AV_CODEC_ID_DVD_SUBTITLE,      0xFFFFFFFF },
     { AV_CODEC_ID_HDMV_PGS_SUBTITLE, 0xFFFFFFFF },
-    { AV_CODEC_ID_ARIB_CAPTION,      0xFFFFFFFF },
     { AV_CODEC_ID_NONE,              0xFFFFFFFF }
 };
 
